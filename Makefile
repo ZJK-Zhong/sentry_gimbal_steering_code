@@ -166,6 +166,8 @@ application/gimbal/gimbal.c \
 application/shoot/shoot.c \
 application/cmd/robot_cmd.c \
 application/board_transport.c \
+application/cmd/robot_control.c \
+application/cmd/vision_command.c \
 application/robot.c
 
 # ASM sources

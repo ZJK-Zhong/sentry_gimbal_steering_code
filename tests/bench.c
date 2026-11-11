@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "general_def.h"
+#include "../application/cmd/robot_control_config.h"
 #include "../application/board_transport.c"
 #include "../application/cmd/robot_cmd.c"
 #include "../modules/remote/remote_control.c"
@@ -136,12 +138,15 @@ static void check_bench_stopped(void)
     CHECK(gimbal_control.bench_active == 1);
 }
 
+#include "policy_context.h"
+
 void test_main(void)
 {
+    TestIndependentControlContexts();
     RobotCMDInit();
     CHECK(test_uart.usart_handle == &huart3);
     CHECK(test_can_count == 1); // Only board link; no motor endpoints.
-    CHECK(board_comm->can_ins->can_handle == &hcan1);
+    CHECK(board_link_instance->can_ins->can_handle == &hcan1);
     CANComm_Init_Config_s config = {
         .can_config = {.can_handle = &hcan1, .tx_id = BOARD_CHASSIS_TX_ID, .rx_id = BOARD_GIMBAL_TX_ID},
         .send_data_len = sizeof(Chassis_Upload_Data_s),

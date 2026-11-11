@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include "general_def.h"
+#include "../application/cmd/robot_control_config.h"
 #include "../application/board_transport.c"
 #include "../application/cmd/robot_cmd.c"
 #include "../application/gimbal/gimbal.c"
@@ -131,11 +133,11 @@ static void motor_frame(DJIMotorInstance *motor, uint16_t ecd, int16_t rpm)
 }
 static void all_feedback(void)
 {
-    motor_frame(yaw_motor, YAW_CHASSIS_ALIGN_ECD, 0);
-    motor_frame(pitch_motor, 1000, 0);
-    motor_frame(friction_l, 1000, -friction_rpm);
-    motor_frame(friction_r, 1000, friction_rpm);
-    motor_frame(loader, 1000, 0);
+    motor_frame(gimbal_yaw_motor, YAW_CHASSIS_ALIGN_ECD, 0);
+    motor_frame(gimbal_pitch_motor, 1000, 0);
+    motor_frame(friction_left_motor, 1000, -friction_rpm);
+    motor_frame(friction_right_motor, 1000, friction_rpm);
+    motor_frame(loader_motor, 1000, 0);
 }
 static void raw_packet(CANCommInstance *sender, unsigned length)
 {
@@ -158,9 +160,9 @@ static void step(uint8_t right, uint8_t left, uint8_t send_feedback)
 static void check_stopped(void)
 {
     CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_ZERO_FORCE);
-    CHECK(yaw_motor->stop_flag == MOTOR_STOP && pitch_motor->stop_flag == MOTOR_STOP);
-    CHECK(friction_l->stop_flag == MOTOR_STOP && friction_r->stop_flag == MOTOR_STOP);
-    CHECK(loader->stop_flag == MOTOR_STOP);
+    CHECK(gimbal_yaw_motor->stop_flag == MOTOR_STOP && gimbal_pitch_motor->stop_flag == MOTOR_STOP);
+    CHECK(friction_left_motor->stop_flag == MOTOR_STOP && friction_right_motor->stop_flag == MOTOR_STOP);
+    CHECK(loader_motor->stop_flag == MOTOR_STOP);
     for (unsigned b = 0; b < 2; ++b)
         for (unsigned g = 0; g < 2; ++g)
             for (unsigned i = 0; i < 8; ++i) CHECK(current_frames[b][g][i] == 0);
@@ -179,30 +181,33 @@ static void vision_frame(uint8_t tracking, uint8_t friction, uint8_t fire)
     test_vision_new = 1;
 }
 
+#include "policy_context.h"
+
 void test_main(void)
 {
+    TestIndependentControlContexts();
     test_imu.YawTotalAngle = 10;
     test_imu.Pitch = -5;
     RobotCMDInit(); GimbalInit(); ShootInit();
     CHECK(test_can_count == 6);
-    CHECK(yaw_motor->motor_can_instance->can_handle == &hcan1);
-    CHECK(yaw_motor->motor_can_instance->rx_id == 0x206);
-    CHECK(pitch_motor->motor_can_instance->can_handle == &hcan2);
-    CHECK(pitch_motor->motor_can_instance->rx_id == 0x205);
-    CHECK(friction_r->motor_can_instance->can_handle == &hcan2);
-    CHECK(friction_r->motor_can_instance->rx_id == 0x206);
-    CHECK(friction_l->motor_can_instance->can_handle == &hcan2);
-    CHECK(friction_l->motor_can_instance->rx_id == 0x207);
-    CHECK(loader->motor_can_instance->can_handle == &hcan2);
-    CHECK(loader->motor_can_instance->rx_id == 0x201);
-    CHECK(board_comm->can_ins->can_handle == &hcan1);
+    CHECK(gimbal_yaw_motor->motor_can_instance->can_handle == &hcan1);
+    CHECK(gimbal_yaw_motor->motor_can_instance->rx_id == 0x206);
+    CHECK(gimbal_pitch_motor->motor_can_instance->can_handle == &hcan2);
+    CHECK(gimbal_pitch_motor->motor_can_instance->rx_id == 0x205);
+    CHECK(friction_right_motor->motor_can_instance->can_handle == &hcan2);
+    CHECK(friction_right_motor->motor_can_instance->rx_id == 0x206);
+    CHECK(friction_left_motor->motor_can_instance->can_handle == &hcan2);
+    CHECK(friction_left_motor->motor_can_instance->rx_id == 0x207);
+    CHECK(loader_motor->motor_can_instance->can_handle == &hcan2);
+    CHECK(loader_motor->motor_can_instance->rx_id == 0x201);
+    CHECK(board_link_instance->can_ins->can_handle == &hcan1);
     CANComm_Init_Config_s peer_config = {
         .can_config = {.can_handle = &hcan1, .tx_id = BOARD_CHASSIS_TX_ID, .rx_id = BOARD_GIMBAL_TX_ID},
         .send_data_len = sizeof(Chassis_Upload_Data_s),
         .recv_data_len = sizeof(Chassis_Ctrl_Cmd_s), .daemon_count = 5};
     peer = CANCommInit(&peer_config);
     peer_feedback.motors_online = peer_feedback.ins_online = 1;
-    CHECK(!CANCommSnapshot(board_comm, &peer_feedback, 100));
+    CHECK(!CANCommSnapshot(board_link_instance, &peer_feedback, 100));
     step(RC_SW_DOWN, RC_SW_UP, 0); check_stopped(); // No first peer feedback.
     step(RC_SW_DOWN, RC_SW_UP, 1); check_stopped(); // Right-down alone is MOVE, not unlock.
     CHECK(gimbal_control.selected_mode == ROBOT_CONTROL_MODE_MOVE && !gimbal_control.armed);
@@ -220,7 +225,7 @@ void test_main(void)
     {
         for (unsigned right = 0; right < 3; ++right)
         {
-            CHECK(RobotModeChoose(positions[left], positions[right]) == expected[left][right]);
+            CHECK(SelectRobotControlMode(positions[left], positions[right]) == expected[left][right]);
             step(positions[right], positions[left], 1);
             RobotControlMode_e mode = expected[left][right];
             CHECK(gimbal_control.selected_mode == mode && gimbal_control.control_mode == mode);
@@ -243,8 +248,8 @@ void test_main(void)
             CHECK(gimbal_control.shoot_cmd.load_mode == (mode == ROBOT_CONTROL_MODE_FIRE ? LOAD_BURSTFIRE : LOAD_STOP));
         }
     }
-    CHECK(RobotModeChoose(0, RC_SW_UP) == ROBOT_CONTROL_MODE_SAFE);
-    CHECK(RobotModeChoose(RC_SW_DOWN, 0) == ROBOT_CONTROL_MODE_SAFE);
+    CHECK(SelectRobotControlMode(0, RC_SW_UP) == ROBOT_CONTROL_MODE_SAFE);
+    CHECK(SelectRobotControlMode(RC_SW_DOWN, 0) == ROBOT_CONTROL_MODE_SAFE);
     step(RC_SW_MID, RC_SW_UP, 1);
     Chassis_Ctrl_Cmd_s decoded;
     CHECK(CANCommSnapshot(peer, &decoded, 50));
@@ -270,12 +275,12 @@ void test_main(void)
     peer_feedback.heat_limit = 200;
     peer_feedback.current_heat = 20;
     step(RC_SW_UP, RC_SW_DOWN, 1);
-    CHECK(shoot_feedback.loader_running && loader->motor_controller.pid_ref == 10000);
+    CHECK(shoot_feedback.loader_running && loader_motor->motor_controller.pid_ref == 10000);
     peer_feedback.current_heat = 180;
     step(RC_SW_UP, RC_SW_DOWN, 1);
-    CHECK(loader->stop_flag == MOTOR_STOP);
+    CHECK(loader_motor->stop_flag == MOTOR_STOP);
     step(RC_SW_DOWN, RC_SW_UP, 1); // MOVE closes the complete shooter.
-    CHECK(friction_l->stop_flag == MOTOR_STOP && friction_r->stop_flag == MOTOR_STOP && loader->stop_flag == MOTOR_STOP);
+    CHECK(friction_left_motor->stop_flag == MOTOR_STOP && friction_right_motor->stop_flag == MOTOR_STOP && loader_motor->stop_flag == MOTOR_STOP);
     step(RC_SW_DOWN, RC_SW_DOWN, 1); check_stopped();
     CHECK(CANCommSnapshot(peer, &decoded, 50) && decoded.chassis_mode == CHASSIS_ZERO_FORCE);
     host_call(4, "PASS: friction-only/fire separation, real heat interlock and all-five-motor zero force\n");
@@ -322,11 +327,11 @@ void test_main(void)
     test_tick += 21;
     step(RC_SW_DOWN, RC_SW_DOWN, 1);
     CHECK(gimbal_control.chassis_online && gimbal_control.armed);
-    uint32_t received_at = board_comm->last_rx_ms;
+    uint32_t received_at = board_link_instance->last_rx_ms;
     test_tick += 5;
     Chassis_Upload_Data_s snapshot;
-    CHECK(CANCommSnapshot(board_comm, &snapshot, 100));
-    CHECK(board_comm->last_rx_ms == received_at);
+    CHECK(CANCommSnapshot(board_link_instance, &snapshot, 100));
+    CHECK(board_link_instance->last_rx_ms == received_at);
     host_call(4, "PASS: corrupt CRC stop, dropped-fragment recovery and unchanged receive timestamp\n");
 
     peer_feedback.current_heat = 20;
@@ -380,7 +385,7 @@ void test_main(void)
     CHECK(!gimbal_control.vision_online && test_vision_rx_ms == vision_received_at);
     CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_NO_FOLLOW);
     CHECK(gimbal_control.chassis_cmd.vx == 0 && gimbal_control.chassis_cmd.chassis_spin_speed == 0);
-    CHECK(gimbal_control.shoot_cmd.shoot_mode == SHOOT_OFF && loader->stop_flag == MOTOR_STOP);
+    CHECK(gimbal_control.shoot_cmd.shoot_mode == SHOOT_OFF && loader_motor->stop_flag == MOTOR_STOP);
     CHECK(gimbal_control.gimbal_cmd.yaw == held_yaw && gimbal_control.gimbal_cmd.pitch == held_pitch);
     vision_frame(0, 0, 0);
     step(RC_SW_DOWN, RC_SW_MID, 1);

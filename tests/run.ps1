@@ -12,7 +12,7 @@ try {
     $flags = @('-mcpu=cortex-m4', '-mthumb', '-mfloat-abi=soft', '-std=gnu11', '-O1',
         '-ffunction-sections', '-fdata-sections', '-DUSE_HAL_DRIVER', '-DSTM32F407xx',
         '-DARM_MATH_CM4', '-DDISABLE_LOG_SYSTEM=1')
-    $sources = @('tests/integration.c', 'tests/startup.s', 'modules/algorithm/controller.c',
+    $sources = @('tests/integration.c', 'tests/startup.s', 'application/cmd/robot_control.c', 'application/cmd/vision_command.c', 'modules/algorithm/controller.c',
         'modules/message_center/message_center.c', 'modules/daemon/daemon.c',
         'modules/motor/DJImotor/dji_motor.c', 'modules/can_comm/can_comm.c',
         'modules/algorithm/crc8.c')
@@ -29,7 +29,7 @@ try {
             if ($LASTEXITCODE) { throw "Integration tests failed for command source $sourceMode" }
         }
         $benchElf = 'build/tests/bench.elf'
-        $benchSources = @('tests/bench.c', 'tests/startup.s',
+        $benchSources = @('tests/bench.c', 'tests/startup.s', 'application/cmd/robot_control.c',
             'modules/message_center/message_center.c', 'modules/daemon/daemon.c',
             'modules/can_comm/can_comm.c', 'modules/algorithm/crc8.c')
         & arm-none-eabi-gcc @flags '-DCHASSIS_BENCH_TEST=1' @includes @benchSources `
