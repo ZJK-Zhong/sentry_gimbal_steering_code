@@ -23,8 +23,10 @@ mingw32-make BENCH_TEST=1 download_dap
 联调产物是`build-bench/sentry_gimbal_steering_code_bench.elf`（同时生成hex/bin），
 与正常`build/sentry_gimbal_steering_code.elf`分目录存放。使用J-Link时将download_dap替换为download_jlink。
 恢复完整云台版：`mingw32-make -j24`后`mingw32-make download_dap`。
-VS Code任务新增`build chassis bench`、`download chassis bench dap/jlink`；
-调试选择`Chassis bench DAPlink`，确保符号与联调固件一致。
+VS Code终端任务只保留原来的`build task`、`download dap`、`download jlink`三个，
+它们构建或烧录正常配置。空板联调请在终端手动执行上面的`BENCH_TEST=1`命令。
+调试选择`Chassis bench DAPlink`前，先手动编译联调固件；此调试配置不再调用额外终端任务，
+并继续加载`build-bench`中的符号，确保与联调固件一致。
 
 CMake等效选项（另建目录）：
 
