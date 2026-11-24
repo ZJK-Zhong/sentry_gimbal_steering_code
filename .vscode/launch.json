@@ -2,6 +2,17 @@
     // 启动调试的快捷键是F5
     "version": "0.2.0",
     "configurations": [
+        {
+            "name": "Orbit Chassis Bench DAPLink",
+            "type": "orbit",
+            "request": "launch",
+            "device": "STM32F407IG",
+            "program": "${workspaceFolder}/build-bench/sentry_gimbal_steering_code_bench.elf",
+            "probe": "cmsis-dap",
+            "interface": "SWD",
+            "flashBeforeDebug": false,
+            "runToEntryPoint": "main"
+        },
 {
         "name": "Chassis bench DAPlink",
         "cwd": "${workspaceFolder}",
