@@ -22,7 +22,7 @@
 #define MANUAL_RIGHT_MMPS_PER_CHANNEL 2.0f       ///< 左右平移比例，mm/s/通道单位。
 #define MANUAL_YAW_DEG_PER_CHANNEL 0.0008f       ///< Yaw每轮增量，deg/通道单位。
 #define MANUAL_PITCH_DEG_PER_CHANNEL 0.002f      ///< Pitch每轮增量，deg/通道单位。
-#define BENCH_YAW_DPS_PER_CHANNEL 0.2f           ///< 空板联调转向比例，deg/s/通道单位。
+#define MANUAL_CHASSIS_YAW_DPS_PER_CHANNEL 0.2f ///< 左上右下底盘转向比例，deg/s/通道单位。
 #define VISION_TRANSLATION_MMPS_PER_UNIT 1400.0f ///< 视觉平移比例，mm/s/协议单位。
 #define VISION_SPIN_RADPS_PER_UNIT 2.0f          ///< 视觉转速比例，rad/s/协议单位。
 #define REMOTE_STOP_DIAL_THRESHOLD 300           ///< 拨轮超过该值撤销解锁。

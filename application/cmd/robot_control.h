@@ -12,7 +12,7 @@
 /**
  * @brief 双板系统的整车操作模式，数值仅用于本板调试。
  * @note 左下：右下无力、右中摩擦、右上发射；左中右下比赛；
- *       左上：右下移动、右中小陀螺、右上视觉发射。其余组合安全停机。
+ *       左上：右下纯底盘遥控、右中小陀螺、右上视觉发射。其余组合安全停机。
  */
 typedef enum
 {
@@ -51,7 +51,8 @@ typedef struct
     uint8_t rc_online;                      ///< 保留调试字段，表示遥控输入有效。
     uint8_t chassis_online;                 ///< 底盘反馈链路有效。
     uint8_t gimbal_online;                  ///< 正常云台版的两轴/INS联锁通过。
-    uint8_t armed;                          ///< 双下解锁；输入失效或拨轮急停撤销。
+    uint8_t armed;                          ///< 双下授予底盘权限；通信/急停或已授权云台工作档失联时撤销。
+    uint8_t gimbal_armed;                   ///< 云台就绪时双下授予；失联清除，恢复在线不能自动获权。
     uint8_t vision_online;                  ///< 视觉命令可供自动模式使用。
     RobotControlMode_e selected_mode;       ///< 拨杆请求的整车模式。
     RobotControlMode_e control_mode;        ///< 联锁和联调限制后的实际模式。
@@ -85,6 +86,9 @@ RobotControlMode_e SelectRobotControlMode(uint8_t left_switch, uint8_t right_swi
  * @param state 非空且已初始化的上下文，状态只属于当前调用方。
  * @param input 当前周期的非空输入快照；本函数不保存其指针。
  * @note CHASSIS_BENCH_TEST只允许手动和小陀螺，不伪造云台在线。
+ *       普通固件双下解锁与左上右下不要求云台在线；后者只输出底盘车体系速度。
+ *       其余工作模式仍要求云台就绪；从纯底盘档恢复云台控制时重捕获当前姿态。
+ *       无云台时途经工作档只执行SAFE，不撤销底盘权限；云台权限须就绪时另经双下授予。
  *       不读取时间、不判断传输超时、不发布话题，便于单独验证策略。
  */
 void RobotControlUpdate(RobotControlState_s *state, const RobotControlInput_s *input);

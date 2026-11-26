@@ -26,6 +26,7 @@ static CANCommInstance *peer;
 static Chassis_Upload_Data_s peer_feedback;
 static int16_t friction_rpm;
 static int16_t test_dial;
+static uint8_t fail_board_transmit;
 static Vision_Recv_s test_vision;
 static uint8_t test_vision_new;
 static uint32_t test_vision_rx_ms;
@@ -91,6 +92,7 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
 void CANSetDLC(CANInstance *instance, uint8_t length) { instance->txconf.DLC = length; }
 uint8_t CANTransmit(CANInstance *instance, float timeout)
 {
+    if (fail_board_transmit && instance == board_link_instance->can_ins) return 0;
     unsigned bus = instance->can_handle == &hcan1 ? 0 : 1;
     if (instance->txconf.StdId == 0x200 || instance->txconf.StdId == 0x1ff)
         memcpy(current_frames[bus][instance->txconf.StdId == 0x1ff], instance->tx_buff, 8);
@@ -183,9 +185,227 @@ static void vision_frame(uint8_t tracking, uint8_t friction, uint8_t fire)
 
 #include "policy_context.h"
 
+/** @brief 底盘权限不因途经工作档丢失，也不能在云台恢复时被提升为云台/发射权限。 */
+static void TestChassisOnlyArmingTransitions(void)
+{
+    RobotControlState_s state;
+    RobotControlInput_s input = {0};
+    RobotControlInit(&state);
+    input.remote_online = input.chassis_online = 1;
+    input.remote.rc.switch_left = input.remote.rc.switch_right = RC_SW_DOWN;
+    RobotControlUpdate(&state, &input);
+    CHECK(state.armed && !state.gimbal_armed);
+
+    const uint8_t left[] = {RC_SW_MID, RC_SW_UP, RC_SW_UP, RC_SW_DOWN, RC_SW_DOWN};
+    const uint8_t right[] = {RC_SW_DOWN, RC_SW_MID, RC_SW_UP, RC_SW_MID, RC_SW_UP};
+    // 云台缺失和后来恢复在线两种情况下，五个云台工作档都必须等待新的双下授权。
+    for (unsigned online = 0; online < 2; ++online)
+    {
+        input.gimbal_online = online;
+        for (unsigned mode = 0; mode < 5; ++mode)
+        {
+            input.remote.rc.switch_left = left[mode];
+            input.remote.rc.switch_right = right[mode];
+            RobotControlUpdate(&state, &input);
+            CHECK(state.armed && !state.gimbal_armed && state.control_mode == ROBOT_CONTROL_MODE_SAFE);
+            CHECK(state.chassis_cmd.chassis_mode == CHASSIS_ZERO_FORCE && state.chassis_cmd.vx == 0);
+            CHECK(state.gimbal_cmd.gimbal_mode == GIMBAL_ZERO_FORCE && state.shoot_cmd.shoot_mode == SHOOT_OFF);
+        }
+        input.remote.rc.switch_left = RC_SW_UP;
+        input.remote.rc.switch_right = RC_SW_DOWN;
+        input.remote.rc.rocker_r1 = 100;
+        RobotControlUpdate(&state, &input);
+        CHECK(state.control_mode == ROBOT_CONTROL_MODE_MOVE && state.chassis_cmd.vx == 600);
+    }
+
+    input.remote.rc.switch_left = input.remote.rc.switch_right = RC_SW_DOWN;
+    RobotControlUpdate(&state, &input);
+    CHECK(state.armed && state.gimbal_armed);
+    input.remote.rc.switch_left = RC_SW_UP;
+    input.remote.rc.switch_right = RC_SW_MID;
+    RobotControlUpdate(&state, &input);
+    CHECK(state.control_mode == ROBOT_CONTROL_MODE_SPIN);
+    input.gimbal_online = 0;
+    RobotControlUpdate(&state, &input);
+    CHECK(!state.armed && !state.gimbal_armed && state.control_mode == ROBOT_CONTROL_MODE_SAFE);
+    input.gimbal_online = 1;
+    RobotControlUpdate(&state, &input);
+    CHECK(!state.armed && state.control_mode == ROBOT_CONTROL_MODE_SAFE); // 不自动恢复。
+
+    for (unsigned fault = 0; fault < 3; ++fault)
+    {
+        input.remote.rc.switch_left = input.remote.rc.switch_right = RC_SW_DOWN;
+        RobotControlUpdate(&state, &input);
+        CHECK(state.armed && state.gimbal_armed);
+        input.remote.rc.switch_left = RC_SW_UP;
+        if (fault == 0) input.remote_online = 0;
+        if (fault == 1) input.chassis_online = 0;
+        if (fault == 2) input.remote.rc.dial = REMOTE_STOP_DIAL_THRESHOLD + 1;
+        RobotControlUpdate(&state, &input);
+        CHECK(!state.armed && !state.gimbal_armed && state.control_mode == ROBOT_CONTROL_MODE_SAFE);
+        input.remote_online = input.chassis_online = 1;
+        input.remote.rc.dial = 0;
+        RobotControlUpdate(&state, &input);
+        CHECK(!state.armed && !state.gimbal_armed && state.control_mode == ROBOT_CONTROL_MODE_SAFE);
+    }
+    host_call(4, "PASS: switch transit preserves chassis arming; gimbal recovery requires double-down; faults revoke permissions\n");
+}
+
+/** @brief 不注入本板电机反馈，仅通过真实DBUS/CAN入口运行普通固件链路。 */
+static void StepWithoutGimbal(uint8_t right, uint8_t left, int16_t forward, int16_t lateral, int16_t yaw)
+{
+    test_tick += 5;
+    remote_frame(right, left, forward, lateral, yaw);
+    CANCommSend(peer, (uint8_t *)&peer_feedback);
+    RobotCMDTask(); GimbalTask(); ShootTask(); DJIMotorControl();
+}
+
+/** @brief 验证普通版无云台电机/有效INS时，双下解锁后仍能向底盘发送三轴速度。 */
+static void TestDirectChassisWithoutGimbal(void)
+{
+    RobotControlInit(&robot_control_state);
+    test_tick += 25; // 使上次所有本板电机反馈过期。
+    test_ins_online = 0;
+    test_imu.YawTotalAngle = test_imu.Pitch = NAN;
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, -100, 100);
+    check_stopped(); // 左上右下不能替代双下解锁。
+    CHECK(!gimbal_control.armed);
+    for (unsigned i = 0; i < 2; ++i)
+        StepWithoutGimbal(RC_SW_DOWN, RC_SW_DOWN, 0, 0, 0);
+    CHECK(gimbal_control.armed && !gimbal_control.gimbal_online);
+    // 模拟真实拨杆：左下 -> 左中(比赛) -> 左上，右开关保持下。
+    // 即使停在中档多个通信周期，也不得撤销底盘权限或输出运动/发射命令。
+    for (unsigned i = 0; i < 30; ++i)
+    {
+        StepWithoutGimbal(RC_SW_DOWN, RC_SW_MID, 100, -100, 100);
+        check_stopped();
+        CHECK(gimbal_control.selected_mode == ROBOT_CONTROL_MODE_COMPETITION);
+        CHECK(gimbal_control.control_mode == ROBOT_CONTROL_MODE_SAFE && gimbal_control.armed);
+        Chassis_Ctrl_Cmd_s stopped;
+        CHECK(CANCommSnapshot(peer, &stopped, 50));
+        CHECK(stopped.chassis_mode == CHASSIS_ZERO_FORCE && stopped.vx == 0 && stopped.vy == 0 && stopped.wz == 0);
+    }
+    for (unsigned i = 0; i < 2; ++i)
+        StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, -100, 100);
+    CHECK(!gimbal_control.bench_active && !gimbal_control.gimbal_online);
+    CHECK(gimbal_control.control_mode == ROBOT_CONTROL_MODE_MOVE);
+    CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_REMOTE);
+    Chassis_Ctrl_Cmd_s received;
+    CHECK(CANCommSnapshot(peer, &received, 50));
+    CHECK(received.mode == 0 && received.offset_angle == 0 && received.chassis_spin_speed == 0);
+    CHECK(received.chassis_mode == CHASSIS_REMOTE);
+    CHECK(fabsf(received.vx - 600) < 0.001f && fabsf(received.vy + 200) < 0.001f);
+    CHECK(fabsf(received.wz + 20 * DEGREE_2_RAD) < 0.0001f);
+    CHECK(gimbal_control.gimbal_cmd.gimbal_mode == GIMBAL_ZERO_FORCE);
+    CHECK(gimbal_yaw_motor->stop_flag == MOTOR_STOP && gimbal_pitch_motor->stop_flag == MOTOR_STOP);
+    CHECK(friction_left_motor->stop_flag == MOTOR_STOP && friction_right_motor->stop_flag == MOTOR_STOP);
+    CHECK(loader_motor->stop_flag == MOTOR_STOP);
+    for (unsigned b = 0; b < 2; ++b)
+        for (unsigned g = 0; g < 2; ++g)
+            for (unsigned i = 0; i < 8; ++i) CHECK(current_frames[b][g][i] == 0);
+
+    // 中位死区与车体系速度限幅在普通版生效，且不依赖残留的云台角度。
+    for (unsigned i = 0; i < 2; ++i)
+        StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 5, -5, 5);
+    CHECK(CANCommSnapshot(peer, &received, 50));
+    CHECK(received.vx == 0 && received.vy == 0 && received.wz == 0);
+    for (unsigned i = 0; i < 2; ++i)
+        StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, -660, 660, -660);
+    CHECK(CANCommSnapshot(peer, &received, 50));
+    CHECK(received.vx == -BOARD_MAX_VX_MMPS && received.vy == 1320);
+    CHECK(fabsf(received.wz - 132 * DEGREE_2_RAD) < 0.0001f);
+
+    StepWithoutGimbal(RC_SW_MID, RC_SW_UP, 100, 0, 0); check_stopped();
+    CHECK(gimbal_control.armed && !robot_control_state.gimbal_armed); // 保留底盘权限，但普通SPIN仍不可执行。
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, 0, 0);
+    CHECK(gimbal_control.control_mode == ROBOT_CONTROL_MODE_MOVE);
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_DOWN, 0, 0, 0);
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, 0, 0);
+    test_dial = 301;
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, 0, 0); check_stopped();
+    CHECK(!gimbal_control.armed);
+    test_dial = 0;
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, 0, 0); check_stopped();
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_DOWN, 0, 0, 0);
+    StepWithoutGimbal(RC_SW_DOWN, RC_SW_UP, 100, 0, 0);
+    test_tick += 101;
+    CANCommSend(peer, (uint8_t *)&peer_feedback);
+    RobotCMDTask(); GimbalTask(); ShootTask(); DJIMotorControl(); check_stopped();
+    CHECK(!gimbal_control.armed); // 遥控超时仍撤销解锁。
+    // 重新接入云台后，从纯底盘档转入SPIN须捕获最新姿态，不能沿用旧云台目标。
+    test_ins_online = 1;
+    test_imu.YawTotalAngle = 123;
+    test_imu.Pitch = 8;
+    step(RC_SW_DOWN, RC_SW_DOWN, 1);
+    step(RC_SW_DOWN, RC_SW_DOWN, 1);
+    step(RC_SW_DOWN, RC_SW_UP, 1);
+    test_imu.YawTotalAngle = 234;
+    test_imu.Pitch = 12;
+    step(RC_SW_DOWN, RC_SW_UP, 1);
+    step(RC_SW_DOWN, RC_SW_UP, 1);
+    step(RC_SW_MID, RC_SW_UP, 1);
+    CHECK(gimbal_control.control_mode == ROBOT_CONTROL_MODE_SPIN);
+    CHECK(gimbal_control.gimbal_cmd.yaw == -234 && gimbal_control.gimbal_cmd.pitch == -12);
+    host_call(4, "PASS: normal firmware direct chassis CAN without gimbal/INS, limits, interlocks and safe gimbal reentry\n");
+}
+
+/** @brief 区分发送入邮箱失败、原始帧接收、CRC/长度错误和半包超时，不改变原协议。 */
+static void TestCommunicationDiagnostics(void)
+{
+    Chassis_Ctrl_Cmd_s command = {0};
+    command.chassis_mode = CHASSIS_REMOTE;
+    uint32_t attempts = board_link_instance->diagnostics.tx_message_count;
+    uint32_t queued = board_link_instance->diagnostics.tx_frame_queued_count;
+    uint32_t failed = board_link_instance->diagnostics.tx_frame_fail_count;
+    uint32_t peer_messages = peer->diagnostics.rx_message_count;
+    fail_board_transmit = 1;
+    BoardTransportSendCommand(&command, 1);
+    CHECK(board_link_debug.traffic.tx_message_count == attempts + 1);
+    CHECK(board_link_debug.traffic.tx_frame_queued_count == queued);
+    CHECK(board_link_debug.traffic.tx_frame_fail_count == failed + 4);
+    CHECK(peer->diagnostics.rx_message_count == peer_messages);
+    fail_board_transmit = 0;
+    BoardTransportSendCommand(&command, 1);
+    CHECK(board_link_debug.traffic.tx_frame_queued_count == queued + 4);
+    CHECK(peer->diagnostics.rx_message_count == peer_messages + 1);
+    CHECK(board_link_debug.can_bus == 1 && board_link_debug.tx_id == 0x312 && board_link_debug.rx_id == 0x311);
+    CHECK(board_link_debug.tx_data_len == 26 && board_link_debug.rx_data_len == 28);
+
+    Chassis_Upload_Data_s feedback;
+    CANCommSend(peer, (uint8_t *)&peer_feedback);
+    CHECK(BoardTransportReadFeedback(&feedback));
+    uint32_t frames = board_link_debug.traffic.rx_frame_count;
+    uint32_t messages = board_link_debug.traffic.rx_message_count;
+    uint32_t crc_errors = board_link_debug.traffic.rx_crc_error_count;
+    peer->raw_sendbuf[peer->send_buf_len - 2] ^= 1;
+    raw_packet(peer, peer->send_buf_len);
+    CHECK(!BoardTransportReadFeedback(&feedback));
+    CHECK(board_link_debug.traffic.rx_frame_count == frames + 4);
+    CHECK(board_link_debug.traffic.rx_message_count == messages);
+    CHECK(board_link_debug.traffic.rx_crc_error_count == crc_errors + 1);
+
+    uint32_t format_errors = board_link_debug.traffic.rx_format_error_count;
+    peer->raw_sendbuf[1] ^= 1;
+    raw_packet(peer, 8);
+    BoardTransportReadFeedback(&feedback);
+    CHECK(board_link_debug.traffic.rx_format_error_count == format_errors + 1);
+    peer->raw_sendbuf[1] ^= 1;
+    raw_packet(peer, 8);
+    uint32_t partial_timeouts = board_link_instance->diagnostics.rx_partial_timeout_count;
+    test_tick += 21;
+    CANCommSend(peer, (uint8_t *)&peer_feedback);
+    CHECK(BoardTransportReadFeedback(&feedback));
+    CHECK(board_link_debug.traffic.rx_partial_timeout_count == partial_timeouts + 1);
+    CHECK(board_link_debug.traffic.rx_message_count == messages + 1);
+    CHECK(board_link_debug.traffic.last_rx_dlc == 8);
+    CHECK(memcmp(board_link_debug.traffic.last_rx_frame, peer->raw_sendbuf + 24, 8) == 0);
+    host_call(4, "PASS: communication diagnostics separate queued/failed TX, raw RX, valid messages, CRC/format errors and partial timeouts\n");
+}
+
 void test_main(void)
 {
     TestIndependentControlContexts();
+    TestChassisOnlyArmingTransitions();
     test_imu.YawTotalAngle = 10;
     test_imu.Pitch = -5;
     RobotCMDInit(); GimbalInit(); ShootInit();
@@ -231,10 +451,11 @@ void test_main(void)
             CHECK(gimbal_control.selected_mode == mode && gimbal_control.control_mode == mode);
             if (mode == ROBOT_CONTROL_MODE_SAFE || mode == ROBOT_CONTROL_MODE_ZERO_FORCE)
             { check_stopped(); continue; }
-            CHECK(gimbal_control.gimbal_cmd.gimbal_mode == GIMBAL_GYRO_MODE);
+            CHECK(gimbal_control.gimbal_cmd.gimbal_mode ==
+                  (mode == ROBOT_CONTROL_MODE_MOVE ? GIMBAL_ZERO_FORCE : GIMBAL_GYRO_MODE));
             CHECK(fabsf(gimbal_control.chassis_cmd.offset_angle) < 0.001f);
             if (mode == ROBOT_CONTROL_MODE_MOVE)
-                CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_FOLLOW_GIMBAL_YAW);
+                CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_REMOTE && gimbal_control.chassis_cmd.mode == 0);
             else if (mode == ROBOT_CONTROL_MODE_SPIN)
                 CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_ROTATE);
             else
@@ -293,7 +514,11 @@ void test_main(void)
     step(RC_SW_DOWN, RC_SW_UP, 1);
     test_ins_online = 0;
     step(RC_SW_DOWN, RC_SW_UP, 1);
-    step(RC_SW_DOWN, RC_SW_UP, 1); check_stopped();
+    step(RC_SW_DOWN, RC_SW_UP, 1);
+    CHECK(gimbal_control.control_mode == ROBOT_CONTROL_MODE_MOVE && !gimbal_control.gimbal_online);
+    CHECK(gimbal_control.chassis_cmd.chassis_mode == CHASSIS_REMOTE);
+    step(RC_SW_MID, RC_SW_UP, 1); check_stopped(); // SPIN仍要求云台权限，不能借用底盘权限运行。
+    CHECK(gimbal_control.armed && !robot_control_state.gimbal_armed);
     test_ins_online = 1;
     step(RC_SW_DOWN, RC_SW_DOWN, 1);
     step(RC_SW_DOWN, RC_SW_DOWN, 1);
@@ -394,5 +619,7 @@ void test_main(void)
     CHECK(fabsf(gimbal_control.gimbal_cmd.pitch - held_pitch - PATROL_PITCH_STEP_DEG) < 0.001f);
     step(RC_SW_DOWN, RC_SW_DOWN, 1); check_stopped();
     host_call(4, "PASS: competition/gimbal-fire vision routing, patrol, finite checks, limits and DWT-based timeout\n");
+    TestDirectChassisWithoutGimbal();
+    TestCommunicationDiagnostics();
     finish(0);
 }

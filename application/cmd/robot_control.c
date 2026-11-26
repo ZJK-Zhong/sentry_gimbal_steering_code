@@ -57,6 +57,25 @@ static int16_t ApplyRemoteDeadband(int16_t value)
     return value > REMOTE_CHANNEL_DEADBAND || value < -REMOTE_CHANNEL_DEADBAND ? value : 0;
 }
 
+/**
+ * @brief 左上右下只将摇杆转换为底盘车体系速度，不读取云台姿态或编码器。
+ * @note 每轮目标已在入口清零；云台/发射目标保持零力，底盘使用mode=0和CHASSIS_REMOTE。
+ *       普通固件与空板联调共用此映射，正负方向、死区和速度上限保持一致。
+ */
+static void ApplyDirectChassisTargets(RobotControlState_s *state, const RC_ctrl_t *remote)
+{
+    Chassis_Ctrl_Cmd_s *chassis = &state->chassis_cmd;
+    chassis->chassis_mode = CHASSIS_REMOTE;
+    chassis->vx = ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r1) * MANUAL_FORWARD_MMPS_PER_CHANNEL,
+                                    BOARD_MAX_VX_MMPS);
+    chassis->vy = ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r_) * MANUAL_RIGHT_MMPS_PER_CHANNEL,
+                                    BOARD_MAX_VY_MMPS);
+    // ch2取负号沿用已确认的转向；先由通道换算deg/s，再换为板间协议的rad/s。
+    chassis->wz = ClampControlValue(
+        -ApplyRemoteDeadband(remote->rc.rocker_l_) * MANUAL_CHASSIS_YAW_DPS_PER_CHANNEL * DEGREE_2_RAD,
+        BOARD_MAX_WZ_RADPS);
+}
+
 #if !CHASSIS_BENCH_TEST
 /** @brief 将角度差归一化到[-180,180]deg，保持连续Yaw目标。 */
 static float WrapControlAngleDeg(float angle)
@@ -168,9 +187,6 @@ static void ApplyRobotControlMode(RobotControlState_s *state, RobotControlMode_e
         UpdateManualTargets(state, remote);
         switch (mode)
         {
-        case ROBOT_CONTROL_MODE_MOVE:
-            chassis->chassis_mode = CHASSIS_FOLLOW_GIMBAL_YAW;
-            break;
         case ROBOT_CONTROL_MODE_SPIN:
             chassis->chassis_mode = CHASSIS_ROTATE;
             chassis->chassis_spin_speed = MANUAL_SPIN_RADPS;
@@ -194,20 +210,17 @@ static void ApplyRobotControlMode(RobotControlState_s *state, RobotControlMode_e
 /** @brief 空上位板只生成底盘目标；手动使用车体系，小陀螺使用入口朝向。 */
 static void ApplyChassisBenchMode(RobotControlState_s *state, RobotControlMode_e mode, const RC_ctrl_t *remote)
 {
-    Chassis_Ctrl_Cmd_s *chassis = &state->chassis_cmd;
-    chassis->vx = ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r1) * MANUAL_FORWARD_MMPS_PER_CHANNEL,
-                                    BOARD_MAX_VX_MMPS);
-    chassis->vy =
-        ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r_) * MANUAL_RIGHT_MMPS_PER_CHANNEL, BOARD_MAX_VY_MMPS);
     if (mode == ROBOT_CONTROL_MODE_MOVE)
     {
-        chassis->chassis_mode = CHASSIS_REMOTE;
-        // ch2负号沿用已确认的实车转向；deg/s转为通信约定的rad/s。
-        chassis->wz = ClampControlValue(
-            -ApplyRemoteDeadband(remote->rc.rocker_l_) * BENCH_YAW_DPS_PER_CHANNEL * DEGREE_2_RAD, BOARD_MAX_WZ_RADPS);
+        ApplyDirectChassisTargets(state, remote);
     }
     else
     {
+        Chassis_Ctrl_Cmd_s *chassis = &state->chassis_cmd;
+        chassis->vx = ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r1) * MANUAL_FORWARD_MMPS_PER_CHANNEL,
+                                        BOARD_MAX_VX_MMPS);
+        chassis->vy = ClampControlValue(ApplyRemoteDeadband(remote->rc.rocker_r_) * MANUAL_RIGHT_MMPS_PER_CHANNEL,
+                                        BOARD_MAX_VY_MMPS);
         chassis->chassis_mode = CHASSIS_ROTATE;
         chassis->mode = 3;
         chassis->chassis_spin_speed = MANUAL_SPIN_RADPS;
@@ -237,18 +250,37 @@ void RobotControlUpdate(RobotControlState_s *state, const RobotControlInput_s *i
     state->selected_mode = input->remote_online
                                ? SelectRobotControlMode(remote->rc.switch_left, remote->rc.switch_right)
                                : ROBOT_CONTROL_MODE_SAFE;
+    uint8_t link_ready = state->rc_online && state->chassis_online &&
+                         remote->rc.dial <= REMOTE_STOP_DIAL_THRESHOLD;
 #if CHASSIS_BENCH_TEST
     // 空板不伪造云台在线；仅联调配置免去云台依赖。
     state->gimbal_online = 0;
     state->vision_online = 0;
-    uint8_t inputs_ready = state->rc_online && state->chassis_online && remote->rc.dial <= REMOTE_STOP_DIAL_THRESHOLD;
+    uint8_t inputs_ready = link_ready;
 #else
     state->gimbal_online = input->gimbal_online;
     state->vision_online = input->vision_online;
-    uint8_t inputs_ready = state->rc_online && state->chassis_online && state->gimbal_online &&
-                           remote->rc.dial <= REMOTE_STOP_DIAL_THRESHOLD;
+    // 无云台时双下只授予底盘权限。途经比赛档可保持此权限，但不能启用云台/发射。
+    uint8_t gimbal_required = state->selected_mode != ROBOT_CONTROL_MODE_ZERO_FORCE &&
+                              state->selected_mode != ROBOT_CONTROL_MODE_MOVE;
+    // 已获云台权限的工作档发生云台失联，仍撤销整车解锁，不能自动恢复运行。
+    if (gimbal_required && state->gimbal_armed && !state->gimbal_online)
+    {
+        state->armed = 0;
+    }
+    // 反馈恢复不会自行补发云台权限，必须在云台就绪时再次双下。
+    if (!link_ready || !state->gimbal_online)
+    {
+        state->gimbal_armed = 0;
+    }
+    else if (state->selected_mode == ROBOT_CONTROL_MODE_ZERO_FORCE)
+    {
+        state->gimbal_armed = 1;
+    }
+    uint8_t inputs_ready = link_ready &&
+                           (!gimbal_required || (state->gimbal_online && state->gimbal_armed));
 #endif
-    if (!inputs_ready)
+    if (!link_ready)
     {
         state->armed = 0;
     }
@@ -279,13 +311,20 @@ void RobotControlUpdate(RobotControlState_s *state, const RobotControlInput_s *i
     }
     if (active)
     {
-        if (!state->was_active)
+        if (state->control_mode == ROBOT_CONTROL_MODE_MOVE)
         {
-            // 沿用两轴目标反向约定；恢复控制时对齐当前INS，避免追赶停机前目标。
-            state->yaw_target_deg = -input->gimbal_feedback.gimbal_imu_data.YawTotalAngle;
-            state->pitch_target_deg = -input->gimbal_feedback.gimbal_imu_data.Pitch;
+            ApplyDirectChassisTargets(state, remote);
         }
-        ApplyRobotControlMode(state, state->control_mode, remote, &input->vision, &input->gimbal_feedback);
+        else
+        {
+            if (!state->was_active || previous_mode == ROBOT_CONTROL_MODE_MOVE)
+            {
+                // 重新启用云台时对齐当前INS；纯底盘档不采集或累计云台目标。
+                state->yaw_target_deg = -input->gimbal_feedback.gimbal_imu_data.YawTotalAngle;
+                state->pitch_target_deg = -input->gimbal_feedback.gimbal_imu_data.Pitch;
+            }
+            ApplyRobotControlMode(state, state->control_mode, remote, &input->vision, &input->gimbal_feedback);
+        }
     }
 #endif
     state->command_send_immediately = mode_changed || (state->was_active && !active);

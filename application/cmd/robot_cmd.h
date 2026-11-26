@@ -12,7 +12,7 @@ typedef struct
     uint8_t rc_online;                      ///< 遥控快照有效。
     uint8_t chassis_online;                 ///< 底盘回传链路有效。
     uint8_t gimbal_online;                  ///< 本板两轴电机与INS就绪。
-    uint8_t armed;                          ///< 已通过双下解锁。
+    uint8_t armed;                          ///< 已通过双下获取底盘权限；云台工作档还有独立就绪/授权检查。
     uint8_t vision_online;                  ///< 视觉命令有效且未超时。
     RobotControlMode_e selected_mode;       ///< 拨杆请求；保护未解除时不等于执行模式。
     RobotControlMode_e control_mode;        ///< 本轮实际执行模式，未解锁/失联时为SAFE。
